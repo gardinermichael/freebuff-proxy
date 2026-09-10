@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"freebuff-proxy/backend/internal/convert"
+	"freebuff-proxy/backend/internal/langfuse"
 	"freebuff-proxy/backend/internal/phasetiming"
 	"freebuff-proxy/backend/internal/pool"
 	"freebuff-proxy/backend/internal/registry"
@@ -52,14 +53,24 @@ type relayFunc func(ctx context.Context, w http.ResponseWriter, up io.Reader, st
 // acquireTimed closure chatCore used to thread into chatAttempt.
 type timedBackend struct {
 	chatBackend
-	phases *phasetiming.Phases
+	phases  *phasetiming.Phases
+	tracing *langfuse.Exporter
 }
 
 func (b *timedBackend) Acquire(ctx context.Context, model string) (*pool.Lease, error) {
 	start := time.Now()
+	ctx, finish := b.tracing.Phase(ctx, "session.acquire")
 	l, err := b.chatBackend.Acquire(ctx, model)
+	finish(err)
 	b.phases.Since(phasetiming.AcquireMS, start)
 	return l, err
+}
+
+func (b *timedBackend) Chat(ctx context.Context, lease *pool.Lease, opts upstream.ChatOptions, body []byte) (io.ReadCloser, error) {
+	ctx, finish := b.tracing.Phase(ctx, "upstream.attempt")
+	r, err := b.chatBackend.Chat(ctx, lease, opts, body)
+	finish(err)
+	return r, err
 }
 
 // fallbackBackend wraps the pooled chatBackend with the issue #100 bounded
@@ -126,6 +137,18 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 	st := &chatTraceState{reqID: reqID, clientRequestID: clientRequestID(r)}
 	ctx, phases := phasetiming.WithContext(context.WithValue(r.Context(), reqIDKey{}, reqID))
 	start := time.Now()
+	ctx, observation := s.tracing.Start(ctx, r.URL.Path, model, reqID, r.Header.Get("X-Langfuse-Session-Id"), originalBodyFromContext(r.Context()))
+	if observation != nil {
+		w.Header().Set("X-Langfuse-Trace-Id", observation.TraceID())
+	}
+	var traceErr error
+	traceModel := model
+	defer func() {
+		if ctx.Err() != nil {
+			traceErr = ctx.Err()
+		}
+		observation.Finish(traceModel, traceErr, st.attempts)
+	}()
 
 	agentID, _ := s.reg.AgentForModel(model)
 	reqAttrs := []any{
@@ -159,6 +182,7 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 		// No stamped snapshot (direct handler calls in tests): load live.
 		cfg = s.cfg.Load()
 	}
+	observation.FreeMode(cfg.CostMode == "free")
 	fallbackUsed := false
 	tok := bearerToken(r)
 	bridge := false
@@ -237,8 +261,9 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 			be = &fallbackBackend{chatBackend: be, p: s.pool, model: model, fallbackModel: fallbackModel, fallbackAfter: cfg.FallbackAfter, fallbackUsed: &fallbackUsed, logger: s.logger}
 		}
 	}
-	be = &timedBackend{chatBackend: be, phases: phases}
+	be = &timedBackend{chatBackend: be, phases: phases, tracing: s.tracing}
 	up, lease, err = s.chatAttempt(ctx, model, normalized, st, be)
+	traceErr = err
 	if err != nil {
 		phases.Since(phasetiming.TotalMS, start)
 		s.traceChat(lease, model, time.Since(start).Milliseconds(), "error", chatErrClass(err), phases.All(), st)
@@ -317,7 +342,8 @@ func (s *Server) chatCore(w http.ResponseWriter, r *http.Request, model string, 
 
 	chatStart := time.Now()
 	stats := &relayStats{servedModel: servedModel, toolMap: toolMap}
-	relay(ctx, w, up, stats, chatStart)
+	traceModel = servedModel
+	relay(ctx, w, observation.Reader(up), stats, chatStart)
 	// Issue #114: record the completed chat as a run step — steps are
 	// batched in memory and sent WITH FINISH (the CLI has no /steps
 	// endpoint). The response message id is not extracted from the stream;

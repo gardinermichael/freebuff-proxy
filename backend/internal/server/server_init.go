@@ -22,6 +22,7 @@ import (
 	"freebuff-proxy/backend/internal/config"
 	"freebuff-proxy/backend/internal/convert"
 	"freebuff-proxy/backend/internal/dashboard"
+	"freebuff-proxy/backend/internal/langfuse"
 	"freebuff-proxy/backend/internal/logring"
 	"freebuff-proxy/backend/internal/pool"
 	"freebuff-proxy/backend/internal/ratelimit"
@@ -44,6 +45,7 @@ const (
 // atomic pointer because /admin/reload swaps it while requests are in flight;
 // every read site must Load() it once per request and use the local.
 type Server struct {
+	tracing *langfuse.Exporter
 	cfg     atomic.Pointer[config.Config]
 	pool    *pool.Pool
 	reg     *registry.Registry
@@ -225,3 +227,6 @@ func (s *Server) Close() error {
 	}
 	return nil
 }
+
+// WithLangfuse enables optional request tracing; the caller owns shutdown.
+func WithLangfuse(e *langfuse.Exporter) Option { return func(s *Server) { s.tracing = e } }

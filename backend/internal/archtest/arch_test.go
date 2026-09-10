@@ -115,7 +115,9 @@ var allowed = map[string][]string{
 	},
 
 	// ---- layer 5+: top of the stack ----
+	"internal/langfuse": {}, // optional OTLP exporter; no backend dependencies
 	"internal/server": { // orchestration point; imports everything below
+		"internal/langfuse",
 		"internal/config",
 		"internal/convert",
 		"internal/dashboard",
@@ -135,6 +137,7 @@ var allowed = map[string][]string{
 		"internal/store", // lifecycle wiring (open/spill/retention)
 	},
 	"internal/cli": {
+		"internal/langfuse",
 		"internal/cli/port",
 		"internal/clicreds",
 		"internal/config",
