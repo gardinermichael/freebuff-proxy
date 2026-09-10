@@ -23,6 +23,7 @@ import (
 	"freebuff-proxy/backend/internal/cli/port"
 	"freebuff-proxy/backend/internal/clicreds"
 	"freebuff-proxy/backend/internal/config"
+	"freebuff-proxy/backend/internal/langfuse"
 	"freebuff-proxy/backend/internal/logring"
 	"freebuff-proxy/backend/internal/notify"
 	"freebuff-proxy/backend/internal/pool"
@@ -355,6 +356,21 @@ func Serve(configPath string, verbose bool, version string) int {
 	// the running version against the latest GitHub release (6h cache).
 	serverOpts = append(serverOpts, server.WithVersion(version, updatecheck.New(updatecheck.DefaultRepo, nil)))
 
+	tracing, traceErr := langfuse.FromEnv(context.Background())
+	if traceErr != nil {
+		logger.Warn("Langfuse disabled", "err", traceErr)
+	}
+	if tracing != nil {
+		logger.Info("Langfuse tracing enabled")
+		serverOpts = append(serverOpts, server.WithLangfuse(tracing))
+		defer func() {
+			flushCtx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+			defer cancel()
+			if err := tracing.Shutdown(flushCtx); err != nil {
+				logger.Warn("Langfuse flush failed")
+			}
+		}()
+	}
 	srv := server.New(&cfg, p, reg, logger, logringHandler, configPath, serverOpts...)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
